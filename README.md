@@ -13,6 +13,8 @@ Did your Cursor chats disappear after you moved, renamed, or re-opened a project
 
 Cursor identifies each workspace by a hash of its identifier URI. Reopening a project from a different path, or saving an Untitled multi-folder workspace as a `.code-workspace` file, mints a new workspace identity and detaches all prior chats from the sidebar. The conversations are still in `globalStorage/state.vscdb` keyed by `composerId` — they just need their `workspaceIdentifier` rewritten to point at the new workspace. That's what this tool does, with backups at every step.
 
+Newer Cursor builds (behind the server-distributed `composer_header_typed_table` feature gate) store chat headers in a typed `composerHeaders` SQLite table instead of the legacy `composer.composerHeaders` blob, and stop reading the blob entirely. The tool detects which store is authoritative on your install (via the `composer.composerHeaders.tableGateEnabled` key) and reads/writes the right one — on gated installs it updates both the table's `workspaceId` column and the header JSON together, and clears stale agent-project membership entries so Cursor's launch reconciliation doesn't regroup moved chats under the old workspace.
+
 It's also useful when nothing is broken: browse every chat you've ever had in any project, move chats between workspaces, and export conversations to Markdown.
 
 ## Install

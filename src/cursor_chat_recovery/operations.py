@@ -260,6 +260,41 @@ def export_chat(chat: ChatDetail, fmt: Literal["markdown", "json"] = "markdown")
     return "\n".join(lines)
 
 
+PROJECT_MEMBERSHIP_KEY = "glass.localAgentProjectMembership.v1"
+
+
+def _drop_stale_project_membership(storage_: Storage, composer_ids: list[str]) -> int:
+    """Remove moved chats from Cursor's agent-project membership map.
+
+    The Agents surface groups chats by project via this ItemTable key
+    (composerId -> projectId), and membership takes precedence over the header's
+    workspaceIdentifier. A stale entry keeps a moved chat grouped under its old
+    workspace's project and can rewrite the chat's identifier back at launch
+    (Cursor's ensureLocalAssignment/_alignAgentIdentifierToRow reconciliation).
+    Dropping the entries is safe: Cursor re-assigns membership from the header's
+    workspaceIdentifier on next launch.
+    """
+    raw = storage_.read_item(PROJECT_MEMBERSHIP_KEY)
+    if raw is None:
+        return 0
+    try:
+        membership = _json.loads(raw)
+    except _json.JSONDecodeError:
+        return 0
+    if not isinstance(membership, dict):
+        return 0
+    moved = set(composer_ids)
+    kept = {k: v for k, v in membership.items() if k not in moved}
+    removed = len(membership) - len(kept)
+    if removed:
+        storage_.write_item(
+            PROJECT_MEMBERSHIP_KEY,
+            _json.dumps(kept, separators=(",", ":"), ensure_ascii=False),
+            op_label="membership_cleanup",
+        )
+    return removed
+
+
 def reassign_chats(
     storage_: Storage,
     composer_ids: list[str],
@@ -290,11 +325,13 @@ def reassign_chats(
     new_data["allComposers"] = new_list
 
     backup_path = storage_.write_headers(new_data, op_label=f"reassign_to_{target_ws_id[:12]}")
+    membership_removed = _drop_stale_project_membership(storage_, composer_ids)
     return ReassignResult(
         backup_path=str(backup_path),
         composer_ids=composer_ids,
         from_workspace_ids=sorted(set(from_ids)),
         to_workspace_id=target_ws_id,
+        membership_entries_removed=membership_removed,
     )
 
 

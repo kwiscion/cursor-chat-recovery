@@ -11,6 +11,11 @@ def minimal_db() -> Path:
 
 
 @pytest.fixture
+def table_db() -> Path:
+    return FIXTURES_DIR / "globalStorage_table_mode.vscdb"
+
+
+@pytest.fixture
 def drift_db() -> Path:
     return FIXTURES_DIR / "globalStorage_schema_drift.vscdb"
 
