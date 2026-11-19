@@ -24,6 +24,36 @@ def _rw(db_path: Path, tmp_path: Path) -> storage.Storage:
     return s
 
 
+EXTRA_COLUMN_VALUES = {"c-t1": "explore", "c-t2": "shell", "c-t3": ""}
+
+
+def _rw_with_extra_column(db_path: Path, tmp_path: Path) -> storage.Storage:
+    """Like _rw, but the table carries a column the tool doesn't know about, as newer
+    Cursor builds do (subagentTypeName lives only in the column, not in the JSON)."""
+    work = tmp_path / "state.vscdb"
+    shutil.copy(db_path, work)
+    con = sqlite3.connect(work)
+    con.execute("ALTER TABLE composerHeaders ADD COLUMN subagentTypeName TEXT")
+    for cid, val in EXTRA_COLUMN_VALUES.items():
+        con.execute(
+            "UPDATE composerHeaders SET subagentTypeName=? WHERE composerId=?", (val, cid)
+        )
+    con.commit()
+    con.close()
+    s = storage.Storage.open_rw(
+        work, backup_dir=tmp_path / "backups", cursor_running_check=lambda: False
+    )
+    s.ensure_session_backup()
+    return s
+
+
+def _extra_column(db_path: Path) -> dict[str, str | None]:
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    rows = con.execute("SELECT composerId, subagentTypeName FROM composerHeaders").fetchall()
+    con.close()
+    return dict(rows)
+
+
 def test_header_table_mode_detection(table_db, minimal_db):
     with storage.Storage.open_readonly(table_db) as s:
         assert s.header_table_mode() is True
@@ -100,6 +130,43 @@ def test_merge_workspaces_in_table_mode(table_db, tmp_path):
     s.close()
     assert res.chats_moved == 2
     assert all(h["workspaceIdentifier"]["id"] == "ws-new" for h in headers)
+
+
+def test_reassign_preserves_unknown_table_columns(table_db, tmp_path):
+    s = _rw_with_extra_column(table_db, tmp_path)
+    operations.reassign_chats(s, ["c-t1"], target_ws_id="ws-new")
+    s.close()
+    # Moved row and untouched rows alike: every header is rewritten on save.
+    assert _extra_column(tmp_path / "state.vscdb") == EXTRA_COLUMN_VALUES
+
+
+def test_merge_preserves_unknown_table_columns(table_db, tmp_path):
+    s = _rw_with_extra_column(table_db, tmp_path)
+    operations.merge_workspaces(s, source_ws_id="ws-old", target_ws_id="ws-new")
+    s.close()
+    assert _extra_column(tmp_path / "state.vscdb") == EXTRA_COLUMN_VALUES
+
+
+def test_undo_roundtrip_preserves_unknown_table_columns(table_db, tmp_path):
+    s = _rw_with_extra_column(table_db, tmp_path)
+    res = operations.reassign_chats(s, ["c-t1"], target_ws_id="ws-new")
+    backup = json.loads(Path(res.backup_path).read_text(encoding="utf-8"))
+    s.write_headers(backup, op_label="undo")
+    s.close()
+    assert _extra_column(tmp_path / "state.vscdb") == EXTRA_COLUMN_VALUES
+
+
+def test_schema_reports_unknown_table_columns(table_db, tmp_path):
+    work = tmp_path / "state.vscdb"
+    shutil.copy(table_db, work)
+    con = sqlite3.connect(work)
+    con.execute("ALTER TABLE composerHeaders ADD COLUMN subagentTypeName TEXT")
+    con.commit()
+    report = schema.detect_mismatch(con)
+    con.close()
+    # Informational only: extra columns are preserved on write, so nothing blocks.
+    assert report.ok
+    assert any("subagentTypeName" in u for u in report.unexpected)
 
 
 def test_list_workspaces_uses_table(table_db, workspace_storage_dir):

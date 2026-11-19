@@ -76,6 +76,8 @@ def detect_mismatch(con: _Queryable) -> SchemaReport:
         for c in EXPECTED_HEADER_TABLE_COLUMNS:
             if c not in cols:
                 missing.append(f"composerHeaders.column:{c}")
+        for c in sorted(cols - EXPECTED_HEADER_TABLE_COLUMNS):
+            unexpected.append(f"composerHeaders.column:{c} (unknown; preserved on write)")
         rows = con.execute(
             f"SELECT value FROM {HEADER_TABLE} ORDER BY recency DESC LIMIT 3"
         ).fetchall()

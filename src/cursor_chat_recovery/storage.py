@@ -287,10 +287,20 @@ class Storage:
         """Upsert every header into the typed table, keeping the derived columns
         (workspaceId, recency, ...) consistent with the value JSON. Cursor regenerates
         the columns from the JSON on its next save, so writing only one of the two
-        would be reverted."""
+        would be reverted.
+
+        ON CONFLICT DO UPDATE rather than INSERT OR REPLACE: REPLACE deletes and
+        re-inserts the row, resetting columns this tool doesn't know about (e.g.
+        subagentTypeName on newer Cursor builds) to NULL."""
         cols = ", ".join(HEADER_TABLE_COLUMNS)
         placeholders = ", ".join("?" for _ in HEADER_TABLE_COLUMNS)
-        sql = f"INSERT OR REPLACE INTO {HEADER_TABLE} ({cols}) VALUES ({placeholders})"
+        updates = ", ".join(
+            f"{c}=excluded.{c}" for c in HEADER_TABLE_COLUMNS if c != "composerId"
+        )
+        sql = (
+            f"INSERT INTO {HEADER_TABLE} ({cols}) VALUES ({placeholders}) "
+            f"ON CONFLICT(composerId) DO UPDATE SET {updates}"
+        )
         for h in headers.get("allComposers", []):
             if not h.get("composerId"):
                 continue
