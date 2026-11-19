@@ -129,6 +129,77 @@ def make_minimal():
     (ws_root / "ws-epsilon" / "state.vscdb").write_bytes(b"")
 
 
+def _table_row(header: dict) -> tuple:
+    """Derive composerHeaders table columns from a header dict, the way Cursor does."""
+    created = header.get("createdAt")
+    updated = header.get("lastUpdatedAt")
+    is_subagent = bool(
+        not header.get("isBestOfNSubcomposer")
+        and (str(header.get("composerId", "")).startswith("task-")
+             or (header.get("subagentInfo") or {}).get("parentComposerId"))
+    )
+    return (
+        header["composerId"],
+        (header.get("workspaceIdentifier") or {}).get("id"),
+        created,
+        updated,
+        1 if header.get("isArchived") else 0,
+        1 if is_subagent else 0,
+        updated if updated is not None else (created or 0),
+        header.get("conversationCheckpointLastUpdatedAt"),
+        json.dumps(header),
+    )
+
+
+def make_table_mode():
+    """Newer Cursor layout: composer_header_typed_table gate ON.
+
+    The typed composerHeaders table is authoritative; the legacy blob is stale
+    (missing one chat, and left exactly as it was at migration time). Also seeds
+    the agent-project membership key so reassign's cleanup path is exercised.
+    """
+    h1 = make_header("c-t1", "Table chat 1", 1_700_000_000_000, "ws-old",
+                     ws_uri="file:///tmp/old")
+    h2 = make_header("c-t2", "Table chat 2", 1_700_000_100_000, "ws-old",
+                     ws_uri="file:///tmp/old")
+    h3 = make_header("c-t3", "Table chat 3 (post-migration)", 1_700_000_200_000, "ws-new",
+                     ws_uri="file:///tmp/new")
+    bubbles = {
+        "c-t1": [
+            make_bubble("tb1", 1, "Hello", 1_700_000_000_000),
+            make_bubble("tb2", 2, "Hi there", 1_700_000_001_000),
+        ],
+        "c-t2": [make_bubble("tb3", 1, "Q", 1_700_000_100_000)],
+        "c-t3": [make_bubble("tb4", 1, "N", 1_700_000_200_000)],
+    }
+    path = FIXTURES / "globalStorage_table_mode.vscdb"
+    # Blob deliberately diverges from the table: it predates c-t3.
+    write_db(path, [h1, h2], bubbles)
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE TABLE composerHeaders ("
+        "composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, "
+        "lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, "
+        "recency INTEGER, checkpointAt INTEGER, value TEXT)"
+    )
+    for h in (h1, h2, h3):
+        con.execute(
+            "INSERT INTO composerHeaders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            _table_row(h),
+        )
+    con.execute(
+        "INSERT INTO ItemTable VALUES (?, ?)",
+        ("composer.composerHeaders.tableGateEnabled", "true"),
+    )
+    con.execute(
+        "INSERT INTO ItemTable VALUES (?, ?)",
+        ("glass.localAgentProjectMembership.v1",
+         json.dumps({"c-t1": "proj-old", "c-other": "proj-x"})),
+    )
+    con.commit()
+    con.close()
+
+
 def make_schema_drift():
     """Same shape but composerId renamed to composerID — exercises mismatch detection."""
     headers = [{
@@ -153,6 +224,7 @@ def make_corrupt():
 
 if __name__ == "__main__":
     make_minimal()
+    make_table_mode()
     make_schema_drift()
     make_corrupt()
     print("Fixtures written to", FIXTURES)
