@@ -9,7 +9,10 @@ requirement, and the project-membership cleanup on reassign.
 import json
 import shutil
 import sqlite3
+from contextlib import closing
 from pathlib import Path
+
+import pytest
 
 from cursor_chat_recovery import operations, schema, storage
 
@@ -112,6 +115,80 @@ def test_reassign_drops_stale_project_membership(table_db, tmp_path):
     assert membership["c-other"] == "proj-x"
 
 
+def test_reassign_only_changes_workspace_fields_for_moved_rows(table_db, tmp_path):
+    with _rw_with_extra_column(table_db, tmp_path) as s:
+        with closing(sqlite3.connect(s.db_path)) as con:
+            con.row_factory = sqlite3.Row
+            with con:
+                # Store metadata that cannot be recovered from the header JSON.
+                con.execute("UPDATE composerHeaders SET recency = recency + 10, isArchived = 1")
+            query = "SELECT * FROM composerHeaders ORDER BY composerId"
+            before = [dict(row) for row in con.execute(query)]
+            operations.reassign_chats(s, ["c-t1"], target_ws_id="ws-new")
+            after = [dict(row) for row in con.execute(query)]
+
+    moved, *untouched = after
+    assert untouched == before[1:]
+    expected = before[0]
+    expected["workspaceId"] = "ws-new"
+    expected_header = json.loads(expected.pop("value"))
+    expected_header["workspaceIdentifier"] = json.loads(before[2]["value"])["workspaceIdentifier"]
+    assert json.loads(moved.pop("value")) == expected_header
+    assert moved == expected
+
+
+def test_reassign_clears_membership_for_actual_moves_only(table_db, tmp_path):
+    key = operations.PROJECT_MEMBERSHIP_KEY
+    with _rw(table_db, tmp_path) as s:
+        membership = {"c-t1": "proj-old", "c-t3": "proj-new", "c-other": "proj-x"}
+        s.connection.execute("UPDATE ItemTable SET value = ? WHERE key = ?", (
+            json.dumps(membership), key,
+        ))
+        s.connection.commit()
+
+        res = operations.reassign_chats(s, ["c-other", "c-t3", "c-t1"], target_ws_id="ws-new")
+        assert res.composer_ids == ["c-t1"]
+        assert res.membership_entries_removed == 1
+        assert json.loads(s.read_item(key)) == {"c-t3": "proj-new", "c-other": "proj-x"}
+
+
+@pytest.mark.parametrize("table_mode", [False, True], ids=["blob", "table"])
+def test_reassign_rolls_back_when_membership_write_fails(table_db, tmp_path, table_mode):
+    key = operations.PROJECT_MEMBERSHIP_KEY
+    with _rw(table_db, tmp_path) as s, closing(sqlite3.connect(s.db_path)) as con:
+        with con:
+            if not table_mode:
+                con.execute(
+                    "UPDATE ItemTable SET value = 'false' WHERE key = ?",
+                    (storage.TABLE_GATE_KEY,),
+                )
+            con.execute("""
+                CREATE TRIGGER block_membership_write
+                BEFORE UPDATE ON ItemTable
+                WHEN OLD.key = 'glass.localAgentProjectMembership.v1'
+                BEGIN
+                    SELECT RAISE(ABORT, 'membership write blocked');
+                END
+            """)
+
+        headers = s.read_headers()
+        membership = s.read_item(key)
+        with pytest.raises(sqlite3.IntegrityError, match="membership write blocked"):
+            operations.reassign_chats(s, ["c-t1"], target_ws_id="ws-new")
+
+        with storage.Storage.open_readonly(s.db_path) as reopened:
+            assert reopened.read_headers() == headers
+            assert reopened.read_item(key) == membership
+
+        with con:
+            con.execute("DROP TRIGGER block_membership_write")
+        res = operations.reassign_chats(s, ["c-t1"], target_ws_id="ws-new")
+        assert res.composer_ids == ["c-t1"]
+        assert res.membership_entries_removed == 1
+        moved = next(h for h in s.read_headers()["allComposers"] if h["composerId"] == "c-t1")
+        assert moved["workspaceIdentifier"]["id"] == "ws-new"
+
+
 def test_reassign_roundtrip_identity_in_table_mode(table_db, tmp_path):
     s = _rw(table_db, tmp_path)
     original = s.read_headers()
@@ -136,7 +213,7 @@ def test_reassign_preserves_unknown_table_columns(table_db, tmp_path):
     s = _rw_with_extra_column(table_db, tmp_path)
     operations.reassign_chats(s, ["c-t1"], target_ws_id="ws-new")
     s.close()
-    # Moved row and untouched rows alike: every header is rewritten on save.
+    # Preserve extra metadata on both moved and untouched rows.
     assert _extra_column(tmp_path / "state.vscdb") == EXTRA_COLUMN_VALUES
 
 
@@ -167,6 +244,21 @@ def test_schema_reports_unknown_table_columns(table_db, tmp_path):
     # Informational only: extra columns are preserved on write, so nothing blocks.
     assert report.ok
     assert any("subagentTypeName" in u for u in report.unexpected)
+
+
+@pytest.mark.parametrize("column", ["value", "recency"])
+def test_schema_reports_missing_table_sample_column(column):
+    columns = ", ".join(name for name in storage.HEADER_TABLE_COLUMNS if name != column)
+    with closing(sqlite3.connect(":memory:")) as con:
+        con.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+        con.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+        con.execute(f"CREATE TABLE composerHeaders ({columns})")
+        con.execute("INSERT INTO ItemTable VALUES (?, 'true')", (storage.TABLE_GATE_KEY,))
+        report = schema.detect_mismatch(con)
+
+    assert not report.ok
+    assert report.samples["header_source"] == "table"
+    assert report.missing == [f"composerHeaders.column:{column}"]
 
 
 def test_list_workspaces_uses_table(table_db, workspace_storage_dir):

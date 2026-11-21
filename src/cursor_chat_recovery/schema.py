@@ -78,18 +78,19 @@ def detect_mismatch(con: _Queryable) -> SchemaReport:
                 missing.append(f"composerHeaders.column:{c}")
         for c in sorted(cols - EXPECTED_HEADER_TABLE_COLUMNS):
             unexpected.append(f"composerHeaders.column:{c} (unknown; preserved on write)")
-        rows = con.execute(
-            f"SELECT value FROM {HEADER_TABLE} ORDER BY recency DESC LIMIT 3"
-        ).fetchall()
-        headers: list[dict[str, Any]] = []
-        for (val,) in rows:
-            if val is None:
-                continue
-            try:
-                headers.append(json.loads(val))
-            except json.JSONDecodeError:
-                missing.append("composerHeaders.value (invalid JSON)")
-        _check_headers(missing, samples, headers)
+        if {"value", "recency"} <= cols:
+            rows = con.execute(
+                f"SELECT value FROM {HEADER_TABLE} ORDER BY recency DESC LIMIT 3"
+            ).fetchall()
+            headers: list[dict[str, Any]] = []
+            for (val,) in rows:
+                if val is None:
+                    continue
+                try:
+                    headers.append(json.loads(val))
+                except json.JSONDecodeError:
+                    missing.append("composerHeaders.value (invalid JSON)")
+            _check_headers(missing, samples, headers)
     elif "ItemTable" in tables:
         if HEADER_TABLE in tables:
             # Table exists but the gate is off: blob is authoritative (Cursor's

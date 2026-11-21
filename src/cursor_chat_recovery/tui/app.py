@@ -287,16 +287,12 @@ def run_tui(
                 reload = getattr(nav.current, "reload", None)
                 if reload is not None:
                     reload()
-                nav.push(
-                    dialogs.ResultScreen(
-                        state,
-                        [
-                            f"Moved {len(res.composer_ids)} chat(s) "
-                            f"to {target_ws.display_name}.",
-                            f"Backup: {res.backup_path}",
-                        ],
-                    )
-                )
+                result_lines = [
+                    f"Moved {len(res.composer_ids)} chat(s) to {target_ws.display_name}."
+                ]
+                if res.backup_path:
+                    result_lines.append(f"Backup: {res.backup_path}")
+                nav.push(dialogs.ResultScreen(state, result_lines))
 
             target_path = target_ws.identifier.uri or target_ws.identifier.id
             nav.push(

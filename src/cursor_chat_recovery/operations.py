@@ -300,36 +300,59 @@ def reassign_chats(
     composer_ids: list[str],
     target_ws_id: str,
 ) -> ReassignResult:
-    headers_data = storage_.read_headers()
+    with storage_.write_transaction():
+        return _reassign_chats(storage_, storage_.read_headers(), composer_ids, target_ws_id)
+
+
+def _reassign_chats(
+    storage_: Storage,
+    headers_data: dict[str, Any],
+    composer_ids: list[str],
+    target_ws_id: str,
+) -> ReassignResult:
     headers_list = headers_data.get("allComposers", [])
-    target_wid = None
-    for h in headers_list:
-        wid = h.get("workspaceIdentifier") or {}
-        if wid.get("id") == target_ws_id:
-            target_wid = copy.deepcopy(wid)
+    target_wid = {"id": target_ws_id}
+    for header in headers_list:
+        workspace = header.get("workspaceIdentifier") or {}
+        if workspace.get("id") == target_ws_id:
+            target_wid = workspace
             break
-    if target_wid is None:
-        target_wid = {"id": target_ws_id}
 
-    from_ids: list[str] = []
+    requested_ids = set(composer_ids)
+    from_ids: set[str] = set()
+    changed_headers: dict[str, dict[str, Any]] = {}
     new_list = []
-    for h in headers_list:
-        if h.get("composerId") in composer_ids:
-            from_ids.append((h.get("workspaceIdentifier") or {}).get("id", ""))
-            new_h = copy.deepcopy(h)
-            new_h["workspaceIdentifier"] = copy.deepcopy(target_wid)
-            new_list.append(new_h)
-        else:
-            new_list.append(h)
-    new_data = dict(headers_data)
-    new_data["allComposers"] = new_list
+    for header in headers_list:
+        composer_id = header.get("composerId")
+        from_id = (header.get("workspaceIdentifier") or {}).get("id", "")
+        if (
+            isinstance(composer_id, str)
+            and composer_id in requested_ids
+            and from_id != target_ws_id
+        ):
+            from_ids.add(from_id)
+            header = dict(header, workspaceIdentifier=copy.deepcopy(target_wid))
+            changed_headers[composer_id] = header
+        new_list.append(header)
 
-    backup_path = storage_.write_headers(new_data, op_label=f"reassign_to_{target_ws_id[:12]}")
-    membership_removed = _drop_stale_project_membership(storage_, composer_ids)
+    moved_ids = [
+        composer_id for composer_id in dict.fromkeys(composer_ids)
+        if composer_id in changed_headers
+    ]
+    if not moved_ids:
+        return ReassignResult("", [], [], target_ws_id)
+
+    new_data = dict(headers_data, allComposers=new_list)
+    backup_path = storage_.write_headers(
+        new_data,
+        op_label=f"reassign_to_{target_ws_id[:12]}",
+        changed_headers=list(changed_headers.values()),
+    )
+    membership_removed = _drop_stale_project_membership(storage_, moved_ids)
     return ReassignResult(
         backup_path=str(backup_path),
-        composer_ids=composer_ids,
-        from_workspace_ids=sorted(set(from_ids)),
+        composer_ids=moved_ids,
+        from_workspace_ids=sorted(from_ids),
         to_workspace_id=target_ws_id,
         membership_entries_removed=membership_removed,
     )
@@ -342,22 +365,16 @@ def merge_workspaces(
 ) -> MergeResult:
     if source_ws_id == target_ws_id:
         raise ValueError("source and target workspace ids must differ")
-    headers_data = storage_.read_headers()
-    composer_ids = [
-        h["composerId"] for h in headers_data.get("allComposers", [])
-        if (h.get("workspaceIdentifier") or {}).get("id") == source_ws_id
-    ]
-    if not composer_ids:
-        return MergeResult(
-            backup_path="",
-            source_workspace_id=source_ws_id,
-            target_workspace_id=target_ws_id,
-            chats_moved=0,
-        )
-    res = reassign_chats(storage_, composer_ids, target_ws_id)
+    with storage_.write_transaction():
+        headers_data = storage_.read_headers()
+        composer_ids = [
+            h["composerId"] for h in headers_data.get("allComposers", [])
+            if (h.get("workspaceIdentifier") or {}).get("id") == source_ws_id
+        ]
+        res = _reassign_chats(storage_, headers_data, composer_ids, target_ws_id)
     return MergeResult(
         backup_path=res.backup_path,
         source_workspace_id=source_ws_id,
         target_workspace_id=target_ws_id,
-        chats_moved=len(composer_ids),
+        chats_moved=len(res.composer_ids),
     )

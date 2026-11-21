@@ -6,7 +6,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -90,8 +91,15 @@ class _ConWrapper:
     def __init__(self, con: sqlite3.Connection) -> None:
         self._con = con
 
+    @property
+    def in_transaction(self) -> bool:
+        return self._con.in_transaction
+
     def commit(self) -> None:
         self._con.commit()
+
+    def rollback(self) -> None:
+        self._con.rollback()
 
     def execute(self, sql: str, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
         return self._con.execute(sql, *args, **kwargs)
@@ -258,23 +266,66 @@ class Storage:
             counts[group] = counts.get(group, 0) + 1
         return counts
 
-    def write_headers(self, headers: dict[str, Any], op_label: str = "op") -> Path:
+    @contextmanager
+    def write_transaction(self) -> Iterator[None]:
+        """Serialize writes and let nested storage calls join the same transaction."""
         if self._readonly:
-            raise ReadOnlyViolation("write_headers on read-only Storage")
-        assert self._session_backup_path and self._session_backup_path.exists(), \
-            "session backup must exist before mutating (call ensure_session_backup first)"
-        assert self._backup_dir is not None
-        before = self.read_headers()
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        op_backup = self._backup_dir / f"composerHeaders_{ts}_{op_label}.json"
-        op_backup.write_text(json.dumps(before, ensure_ascii=False), encoding="utf-8")
-        if self.header_table_mode():
-            self._write_headers_to_table(headers)
-        else:
-            self._write_headers_to_blob(headers)
-        self._con.commit()
-        self._con.execute("PRAGMA wal_checkpoint(FULL)")
+            raise ReadOnlyViolation("write_transaction on read-only Storage")
+        if self._con.in_transaction:
+            yield
+            return
+
+        self._con.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self._con.commit()
+        except BaseException:
+            self._con.rollback()
+            raise
+
+        # A checkpoint is optional after commit. SQLite can replay the committed WAL.
+        with suppress(sqlite3.OperationalError):
+            self._con.execute("PRAGMA wal_checkpoint(FULL)")
+
+    def write_headers(
+        self,
+        headers: dict[str, Any],
+        op_label: str = "op",
+        *,
+        changed_headers: list[dict[str, Any]] | None = None,
+    ) -> Path:
+        """Back up headers and write a move or restore to the authoritative store."""
+        with self.write_transaction():
+            assert self._session_backup_path and self._session_backup_path.exists(), (
+                "session backup must exist before mutating (call ensure_session_backup first)"
+            )
+            assert self._backup_dir is not None
+            before = self.read_headers()
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            op_backup = self._backup_dir / f"composerHeaders_{ts}_{op_label}.json"
+            op_backup.write_text(json.dumps(before, ensure_ascii=False), encoding="utf-8")
+            if not self.header_table_mode():
+                self._write_headers_to_blob(headers)
+            elif changed_headers is None:
+                self._write_headers_to_table(headers)
+            else:
+                self._update_header_workspaces(changed_headers)
         return op_backup
+
+    def _update_header_workspaces(self, headers: list[dict[str, Any]]) -> None:
+        # Cursor filters on workspaceId and derives it again from value on save.
+        for header in headers:
+            composer_id = header["composerId"]
+            result = self._con.execute(
+                f"UPDATE {HEADER_TABLE} SET workspaceId=?, value=? WHERE composerId=?",
+                (
+                    header["workspaceIdentifier"]["id"],
+                    json.dumps(header, separators=(",", ":"), ensure_ascii=False),
+                    composer_id,
+                ),
+            )
+            if result.rowcount != 1:
+                raise ValueError(f"No typed header row for chat {composer_id!r}")
 
     def _write_headers_to_blob(self, headers: dict[str, Any]) -> None:
         new_raw = json.dumps(headers, separators=(",", ":"), ensure_ascii=False)
@@ -311,22 +362,21 @@ class Storage:
 
         Returns the backup path, or None when the key was previously absent
         (nothing to back up; the write still happens)."""
-        if self._readonly:
-            raise ReadOnlyViolation("write_item on read-only Storage")
-        assert self._session_backup_path and self._session_backup_path.exists(), \
-            "session backup must exist before mutating (call ensure_session_backup first)"
-        assert self._backup_dir is not None
-        before = self.read_item(key)
-        op_backup: Path | None = None
-        if before is not None:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            safe_key = key.replace("/", "_").replace(".", "_")
-            op_backup = self._backup_dir / f"item_{safe_key}_{ts}_{op_label}.txt"
-            op_backup.write_text(before, encoding="utf-8")
-        self._con.execute(
-            "INSERT INTO ItemTable (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
-        self._con.commit()
+        with self.write_transaction():
+            assert self._session_backup_path and self._session_backup_path.exists(), (
+                "session backup must exist before mutating (call ensure_session_backup first)"
+            )
+            assert self._backup_dir is not None
+            before = self.read_item(key)
+            op_backup: Path | None = None
+            if before is not None:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                safe_key = key.replace("/", "_").replace(".", "_")
+                op_backup = self._backup_dir / f"item_{safe_key}_{ts}_{op_label}.txt"
+                op_backup.write_text(before, encoding="utf-8")
+            self._con.execute(
+                "INSERT INTO ItemTable (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
         return op_backup
