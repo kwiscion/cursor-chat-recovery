@@ -17,10 +17,21 @@ except PackageNotFoundError:  # running from source without install
 
 
 def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path | None]:
+    """Each override applies on its own; only what was not given falls back to the
+    installed Cursor's locations."""
     if args.global_db and args.workspace_storage:
         return Path(args.global_db), Path(args.workspace_storage), None
     loc = paths.locate_cursor_dirs()
-    return loc.global_storage_db, loc.workspace_storage_dir, loc.workspaces_dir
+    global_db = Path(args.global_db) if args.global_db else loc.global_storage_db
+    if args.workspace_storage:
+        return global_db, Path(args.workspace_storage), None
+    return global_db, loc.workspace_storage_dir, loc.workspaces_dir
+
+
+def _resolve_global_db(args: argparse.Namespace) -> Path:
+    if args.global_db:
+        return Path(args.global_db)
+    return paths.locate_cursor_dirs().global_storage_db
 
 
 def _do_list(args: argparse.Namespace) -> int:
@@ -49,7 +60,7 @@ def _do_list(args: argparse.Namespace) -> int:
 
 
 def _do_export(args: argparse.Namespace) -> int:
-    global_db, _, _ = _resolve_paths(args)
+    global_db = _resolve_global_db(args)
     with storage.Storage.open_readonly(global_db) as s:
         chat = operations.load_chat(s, args.export)
         out = operations.export_chat(chat, fmt=args.format)
@@ -64,7 +75,8 @@ def _do_reassign(args: argparse.Namespace) -> int:
     if not args.yes:
         print("error: --reassign requires --yes for non-interactive mutation", file=sys.stderr)
         return 1
-    global_db, _, _ = _resolve_paths(args)
+    global_db = _resolve_global_db(args)
+    print(f"Target DB: {global_db}")
     backup_dir = (
         Path(args.backup_dir) if args.backup_dir
         else Path.home() / ".cursor-chat-recovery" / "backups"
@@ -88,7 +100,8 @@ def _do_merge(args: argparse.Namespace) -> int:
     if not args.yes:
         print("error: --merge requires --yes for non-interactive mutation", file=sys.stderr)
         return 1
-    global_db, _, _ = _resolve_paths(args)
+    global_db = _resolve_global_db(args)
+    print(f"Target DB: {global_db}")
     backup_dir = (
         Path(args.backup_dir) if args.backup_dir
         else Path.home() / ".cursor-chat-recovery" / "backups"
