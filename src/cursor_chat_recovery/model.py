@@ -66,6 +66,7 @@ class ReassignResult:
     composer_ids: list[str]
     from_workspace_ids: list[str]
     to_workspace_id: str
+    membership_entries_removed: int = 0
 
 
 @dataclass(frozen=True)

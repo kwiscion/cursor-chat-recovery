@@ -92,7 +92,8 @@ def _do_reassign(args: argparse.Namespace) -> int:
     res = operations.reassign_chats(s, composer_ids, target_ws_id=target_ws_id)
     s.close()
     print(f"Reassigned {len(res.composer_ids)} chat(s) to {res.to_workspace_id}")
-    print(f"Headers backup: {res.backup_path}")
+    if res.backup_path:
+        print(f"Headers backup: {res.backup_path}")
     return 0
 
 
